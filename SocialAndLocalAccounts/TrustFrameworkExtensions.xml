@@ -12,8 +12,33 @@
     <TenantId>yourtenant.onmicrosoft.com</TenantId>
     <PolicyId>B2C_1A_TrustFrameworkLocalization</PolicyId>
   </BasePolicy>
- <BuildingBlocks>
-      
+
+  <BuildingBlocks>
+    <ClaimsSchema>
+      <!-- Extension attribute persisted to the directory to flag that this account
+           has been migrated to SSO. Once true, local password login and password
+           reset are blocked. Requires the b2c-extensions-app IDs in AAD-Common. -->
+      <ClaimType Id="extension_ssoMigrated">
+        <DisplayName>SSO Migrated</DisplayName>
+        <DataType>boolean</DataType>
+        <UserHelpText>Indicates if user migrated to SSO</UserHelpText>
+      </ClaimType>
+    </ClaimsSchema>
+
+    <ClaimsTransformations>
+      <!-- Asserts that extension_ssoMigrated == false.
+           When the claim is true (user already migrated), this assertion FAILS and
+           the parent SelfAsserted provider shows the error message defined in its
+           UserMessageIfClaimsTransformationBooleanValueIsNotEqual metadata key. -->
+      <ClaimsTransformation Id="AssertNotSsoMigrated" TransformationMethod="AssertBooleanClaimIsEqualToValue">
+        <InputClaims>
+          <InputClaim ClaimTypeReferenceId="extension_ssoMigrated" TransformationClaimType="inputClaim" />
+        </InputClaims>
+        <InputParameters>
+          <InputParameter Id="valueToCompareTo" DataType="boolean" Value="false" />
+        </InputParameters>
+      </ClaimsTransformation>
+    </ClaimsTransformations>
   </BuildingBlocks>
 
   <ClaimsProviders>
@@ -31,11 +56,10 @@
       </TechnicalProfiles>
     </ClaimsProvider>
 
-
     <ClaimsProvider>
       <DisplayName>Local Account SignIn</DisplayName>
       <TechnicalProfiles>
-         <TechnicalProfile Id="login-NonInteractive">
+        <TechnicalProfile Id="login-NonInteractive">
           <Metadata>
             <Item Key="client_id">ProxyIdentityExperienceFrameworkAppId</Item>
             <Item Key="IdTokenAudience">IdentityExperienceFrameworkAppId</Item>
@@ -48,10 +72,328 @@
       </TechnicalProfiles>
     </ClaimsProvider>
 
+    <!-- ============================================================
+         SSO TAKEOVER: Azure AD Directory Operations
+         ============================================================ -->
+    <ClaimsProvider>
+      <DisplayName>Azure Active Directory - SSO Takeover</DisplayName>
+      <TechnicalProfiles>
+
+        <!-- Override AAD-Common to enable extension attributes.
+             Replace the placeholder values with your b2c-extensions-app IDs from:
+             Azure Portal > App registrations > b2c-extensions-app > Overview
+             ApplicationObjectId = Object ID,  ClientId = Application (client) ID -->
+        <TechnicalProfile Id="AAD-Common">
+          <Metadata>
+            <Item Key="ApplicationObjectId">INSERT_EXTENSIONS_APP_OBJECT_ID</Item>
+            <Item Key="ClientId">INSERT_EXTENSIONS_APP_CLIENT_ID</Item>
+          </Metadata>
+        </TechnicalProfile>
+
+        <!-- Read local account by email for SSO takeover check.
+             Does NOT raise an error if no account is found — returns empty objectId. -->
+        <TechnicalProfile Id="AAD-UserReadUsingEmailAddress-Takeover">
+          <Metadata>
+            <Item Key="Operation">Read</Item>
+            <Item Key="RaiseErrorIfClaimsPrincipalDoesNotExist">false</Item>
+          </Metadata>
+          <IncludeInSso>false</IncludeInSso>
+          <InputClaims>
+            <InputClaim ClaimTypeReferenceId="email" PartnerClaimType="signInNames.emailAddress" Required="true" />
+          </InputClaims>
+          <OutputClaims>
+            <OutputClaim ClaimTypeReferenceId="objectId" />
+            <OutputClaim ClaimTypeReferenceId="extension_ssoMigrated" />
+          </OutputClaims>
+          <IncludeTechnicalProfile ReferenceId="AAD-Common" />
+        </TechnicalProfile>
+
+        <!-- Link the SSO identity (alternativeSecurityId) to an existing local account
+             and set extension_ssoMigrated = true.
+             The local password is NOT deleted — it is blocked logically via the
+             extension_ssoMigrated flag check in the local sign-in validation chain. -->
+        <TechnicalProfile Id="AAD-LinkSSOToExistingUser">
+          <Metadata>
+            <Item Key="Operation">Write</Item>
+            <Item Key="RaiseErrorIfClaimsPrincipalDoesNotExist">true</Item>
+          </Metadata>
+          <IncludeInSso>false</IncludeInSso>
+          <InputClaims>
+            <InputClaim ClaimTypeReferenceId="objectId" Required="true" />
+          </InputClaims>
+          <PersistedClaims>
+            <PersistedClaim ClaimTypeReferenceId="objectId" />
+            <PersistedClaim ClaimTypeReferenceId="alternativeSecurityId" />
+            <PersistedClaim ClaimTypeReferenceId="extension_ssoMigrated" DefaultValue="true" />
+          </PersistedClaims>
+          <OutputClaims>
+            <OutputClaim ClaimTypeReferenceId="extension_ssoMigrated" DefaultValue="true" AlwaysUseDefaultValue="true" />
+          </OutputClaims>
+          <IncludeTechnicalProfile ReferenceId="AAD-Common" />
+          <UseTechnicalProfileForSessionManagement ReferenceId="SM-AAD" />
+        </TechnicalProfile>
+
+        <!-- Read extension_ssoMigrated flag by objectId.
+             Used as a validation TP after login-NonInteractive and after email
+             verification in password reset. -->
+        <TechnicalProfile Id="AAD-ReadSsoMigratedFlag">
+          <Metadata>
+            <Item Key="Operation">Read</Item>
+            <Item Key="RaiseErrorIfClaimsPrincipalDoesNotExist">true</Item>
+          </Metadata>
+          <IncludeInSso>false</IncludeInSso>
+          <InputClaims>
+            <InputClaim ClaimTypeReferenceId="objectId" Required="true" />
+          </InputClaims>
+          <OutputClaims>
+            <OutputClaim ClaimTypeReferenceId="extension_ssoMigrated" />
+          </OutputClaims>
+          <IncludeTechnicalProfile ReferenceId="AAD-Common" />
+        </TechnicalProfile>
+
+      </TechnicalProfiles>
+    </ClaimsProvider>
+
+    <!-- Claims-transformation TP that runs the AssertNotSsoMigrated transformation.
+         Called as a validation TP with a precondition so it only executes when
+         extension_ssoMigrated == "True". When the assertion fires it always fails
+         (true != false), surfacing the error message from the parent SelfAsserted TP. -->
+    <ClaimsProvider>
+      <DisplayName>SSO Migration Check</DisplayName>
+      <TechnicalProfiles>
+        <TechnicalProfile Id="ThrowSsoMigratedError">
+          <DisplayName>Block SSO Migrated Users</DisplayName>
+          <Protocol Name="Proprietary" Handler="Web.TPEngine.Providers.ClaimsTransformationProtocolProvider, Web.TPEngine, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null" />
+          <InputClaims>
+            <InputClaim ClaimTypeReferenceId="extension_ssoMigrated" />
+          </InputClaims>
+          <OutputClaimsTransformations>
+            <OutputClaimsTransformation ReferenceId="AssertNotSsoMigrated" />
+          </OutputClaimsTransformations>
+        </TechnicalProfile>
+      </TechnicalProfiles>
+    </ClaimsProvider>
+
+    <!-- Override local account sign-in to check SSO migration flag AFTER
+         password validation succeeds. If the user is migrated, the assertion
+         fails and shows a friendly error message instead of signing in. -->
+    <ClaimsProvider>
+      <DisplayName>Local Account</DisplayName>
+      <TechnicalProfiles>
+        <TechnicalProfile Id="SelfAsserted-LocalAccountSignin-Email">
+          <Metadata>
+            <Item Key="UserMessageIfClaimsTransformationBooleanValueIsNotEqual">This account has been migrated to SSO. Please sign in with your identity provider instead.</Item>
+          </Metadata>
+          <OutputClaims>
+            <OutputClaim ClaimTypeReferenceId="signInName" Required="true" />
+            <OutputClaim ClaimTypeReferenceId="password" Required="true" />
+            <OutputClaim ClaimTypeReferenceId="objectId" />
+            <OutputClaim ClaimTypeReferenceId="authenticationSource" />
+            <OutputClaim ClaimTypeReferenceId="extension_ssoMigrated" />
+          </OutputClaims>
+          <ValidationTechnicalProfiles>
+            <ValidationTechnicalProfile ReferenceId="login-NonInteractive" />
+            <ValidationTechnicalProfile ReferenceId="AAD-ReadSsoMigratedFlag" />
+            <ValidationTechnicalProfile ReferenceId="ThrowSsoMigratedError">
+              <Preconditions>
+                <Precondition Type="ClaimEquals" ExecuteActionsIf="false">
+                  <Value>extension_ssoMigrated</Value>
+                  <Value>True</Value>
+                  <Action>SkipThisValidationTechnicalProfile</Action>
+                </Precondition>
+              </Preconditions>
+            </ValidationTechnicalProfile>
+          </ValidationTechnicalProfiles>
+        </TechnicalProfile>
+
+        <!-- Override password reset email verification to also check the SSO
+             migration flag. If the user is migrated, they see an error instead
+             of being allowed to set a new password. -->
+        <TechnicalProfile Id="LocalAccountDiscoveryUsingEmailAddress">
+          <Metadata>
+            <Item Key="UserMessageIfClaimsTransformationBooleanValueIsNotEqual">This account has been migrated to SSO. Password reset is not available. Please sign in with your identity provider.</Item>
+          </Metadata>
+          <OutputClaims>
+            <OutputClaim ClaimTypeReferenceId="email" PartnerClaimType="Verified.Email" Required="true" />
+            <OutputClaim ClaimTypeReferenceId="objectId" />
+            <OutputClaim ClaimTypeReferenceId="userPrincipalName" />
+            <OutputClaim ClaimTypeReferenceId="authenticationSource" />
+            <OutputClaim ClaimTypeReferenceId="extension_ssoMigrated" />
+          </OutputClaims>
+          <ValidationTechnicalProfiles>
+            <ValidationTechnicalProfile ReferenceId="AAD-UserReadUsingEmailAddress" />
+            <ValidationTechnicalProfile ReferenceId="AAD-ReadSsoMigratedFlag" />
+            <ValidationTechnicalProfile ReferenceId="ThrowSsoMigratedError">
+              <Preconditions>
+                <Precondition Type="ClaimEquals" ExecuteActionsIf="false">
+                  <Value>extension_ssoMigrated</Value>
+                  <Value>True</Value>
+                  <Action>SkipThisValidationTechnicalProfile</Action>
+                </Precondition>
+              </Preconditions>
+            </ValidationTechnicalProfile>
+          </ValidationTechnicalProfiles>
+        </TechnicalProfile>
+      </TechnicalProfiles>
+    </ClaimsProvider>
+
   </ClaimsProviders>
 
-    <!--UserJourneys>
-	
-	</UserJourneys-->
+  <!-- ============================================================
+       SSO TAKEOVER USER JOURNEY
+       ============================================================
+       Scenarios handled:
+         A. Local signup (email+password):        Standard flow, no changes
+         B. SSO login, existing local account:    TAKEOVER → link + set flag
+         C. SSO login, no existing account:       Standard social account creation
+         D. Returning SSO user (already linked):  Standard social sign-in
+         E. Local login after takeover:           Blocked (extension_ssoMigrated = true)
+         F. Password reset after takeover:        Blocked (extension_ssoMigrated = true)
+       ============================================================ -->
+  <UserJourneys>
+    <UserJourney Id="SignUpOrSignIn">
+      <OrchestrationSteps>
+
+        <!-- Step 1: Show login options (Facebook SSO + local email/password) -->
+        <OrchestrationStep Order="1" Type="CombinedSignInAndSignUp" ContentDefinitionReferenceId="api.signuporsignin">
+          <ClaimsProviderSelections>
+            <ClaimsProviderSelection TargetClaimsExchangeId="FacebookExchange" />
+            <ClaimsProviderSelection ValidationClaimsExchangeId="LocalAccountSigninEmailExchange" />
+          </ClaimsProviderSelections>
+          <ClaimsExchanges>
+            <ClaimsExchange Id="LocalAccountSigninEmailExchange" TechnicalProfileReferenceId="SelfAsserted-LocalAccountSignin-Email" />
+          </ClaimsExchanges>
+        </OrchestrationStep>
+
+        <!-- Step 2: Execute selected exchange (SSO or local signup).
+             Skipped if local sign-in already set objectId in Step 1. -->
+        <OrchestrationStep Order="2" Type="ClaimsExchange">
+          <Preconditions>
+            <Precondition Type="ClaimsExist" ExecuteActionsIf="true">
+              <Value>objectId</Value>
+              <Action>SkipThisOrchestrationStep</Action>
+            </Precondition>
+          </Preconditions>
+          <ClaimsExchanges>
+            <ClaimsExchange Id="FacebookExchange" TechnicalProfileReferenceId="Facebook-OAUTH" />
+            <ClaimsExchange Id="SignUpWithLogonEmailExchange" TechnicalProfileReferenceId="LocalAccountSignUpWithLogonEmail" />
+          </ClaimsExchanges>
+        </OrchestrationStep>
+
+        <!-- Step 3: For social auth — check if the user already has a linked social account.
+             If found, objectId is set (returning SSO user). If not found, objectId remains empty.
+             Skipped for local account authentication. -->
+        <OrchestrationStep Order="3" Type="ClaimsExchange">
+          <Preconditions>
+            <Precondition Type="ClaimEquals" ExecuteActionsIf="true">
+              <Value>authenticationSource</Value>
+              <Value>localAccountAuthentication</Value>
+              <Action>SkipThisOrchestrationStep</Action>
+            </Precondition>
+          </Preconditions>
+          <ClaimsExchanges>
+            <ClaimsExchange Id="AADUserReadUsingAlternativeSecurityId" TechnicalProfileReferenceId="AAD-UserReadUsingAlternativeSecurityId-NoError" />
+          </ClaimsExchanges>
+        </OrchestrationStep>
+
+        <!-- Step 4 [SSO TAKEOVER]: Read existing local account by email.
+             First-time SSO users only (objectId not yet set). Checks if a local
+             account exists with the same email the SSO provider returned.
+             If found → objectId + extension_ssoMigrated are set. -->
+        <OrchestrationStep Order="4" Type="ClaimsExchange">
+          <Preconditions>
+            <Precondition Type="ClaimEquals" ExecuteActionsIf="true">
+              <Value>authenticationSource</Value>
+              <Value>localAccountAuthentication</Value>
+              <Action>SkipThisOrchestrationStep</Action>
+            </Precondition>
+            <Precondition Type="ClaimsExist" ExecuteActionsIf="true">
+              <Value>objectId</Value>
+              <Action>SkipThisOrchestrationStep</Action>
+            </Precondition>
+            <Precondition Type="ClaimsExist" ExecuteActionsIf="false">
+              <Value>email</Value>
+              <Action>SkipThisOrchestrationStep</Action>
+            </Precondition>
+          </Preconditions>
+          <ClaimsExchanges>
+            <ClaimsExchange Id="ReadByEmail" TechnicalProfileReferenceId="AAD-UserReadUsingEmailAddress-Takeover" />
+          </ClaimsExchanges>
+        </OrchestrationStep>
+
+        <!-- Step 5 [SSO TAKEOVER]: Link SSO identity to existing local account.
+             Writes alternativeSecurityId + sets extension_ssoMigrated = true.
+             Skipped if no objectId (no local account found) or already migrated. -->
+        <OrchestrationStep Order="5" Type="ClaimsExchange">
+          <Preconditions>
+            <Precondition Type="ClaimsExist" ExecuteActionsIf="false">
+              <Value>objectId</Value>
+              <Action>SkipThisOrchestrationStep</Action>
+            </Precondition>
+            <Precondition Type="ClaimEquals" ExecuteActionsIf="true">
+              <Value>authenticationSource</Value>
+              <Value>localAccountAuthentication</Value>
+              <Action>SkipThisOrchestrationStep</Action>
+            </Precondition>
+            <Precondition Type="ClaimEquals" ExecuteActionsIf="true">
+              <Value>extension_ssoMigrated</Value>
+              <Value>True</Value>
+              <Action>SkipThisOrchestrationStep</Action>
+            </Precondition>
+          </Preconditions>
+          <ClaimsExchanges>
+            <ClaimsExchange Id="LinkSSO" TechnicalProfileReferenceId="AAD-LinkSSOToExistingUser" />
+          </ClaimsExchanges>
+        </OrchestrationStep>
+
+        <!-- Step 6: Self-asserted page for brand-new social users (no existing account).
+             Skipped if objectId already exists (from social lookup, local merge, or local auth). -->
+        <OrchestrationStep Order="6" Type="ClaimsExchange">
+          <Preconditions>
+            <Precondition Type="ClaimsExist" ExecuteActionsIf="true">
+              <Value>objectId</Value>
+              <Action>SkipThisOrchestrationStep</Action>
+            </Precondition>
+          </Preconditions>
+          <ClaimsExchanges>
+            <ClaimsExchange Id="SelfAsserted-Social" TechnicalProfileReferenceId="SelfAsserted-Social" />
+          </ClaimsExchanges>
+        </OrchestrationStep>
+
+        <!-- Step 7: Read user attributes for local accounts.
+             Skipped for social IDP authentication. -->
+        <OrchestrationStep Order="7" Type="ClaimsExchange">
+          <Preconditions>
+            <Precondition Type="ClaimEquals" ExecuteActionsIf="true">
+              <Value>authenticationSource</Value>
+              <Value>socialIdpAuthentication</Value>
+              <Action>SkipThisOrchestrationStep</Action>
+            </Precondition>
+          </Preconditions>
+          <ClaimsExchanges>
+            <ClaimsExchange Id="AADUserReadWithObjectId" TechnicalProfileReferenceId="AAD-UserReadUsingObjectId" />
+          </ClaimsExchanges>
+        </OrchestrationStep>
+
+        <!-- Step 8: Fallback — create new social account if no account exists yet. -->
+        <OrchestrationStep Order="8" Type="ClaimsExchange">
+          <Preconditions>
+            <Precondition Type="ClaimsExist" ExecuteActionsIf="true">
+              <Value>objectId</Value>
+              <Action>SkipThisOrchestrationStep</Action>
+            </Precondition>
+          </Preconditions>
+          <ClaimsExchanges>
+            <ClaimsExchange Id="AADUserWrite" TechnicalProfileReferenceId="AAD-UserWriteUsingAlternativeSecurityId" />
+          </ClaimsExchanges>
+        </OrchestrationStep>
+
+        <!-- Step 9: Issue JWT token -->
+        <OrchestrationStep Order="9" Type="SendClaims" CpimIssuerTechnicalProfileReferenceId="JwtIssuer" />
+
+      </OrchestrationSteps>
+      <ClientDefinition ReferenceId="DefaultWeb" />
+    </UserJourney>
+  </UserJourneys>
 
 </TrustFrameworkPolicy>
