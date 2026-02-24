@@ -1,5 +1,72 @@
 # Local and social accounts sign-up or sign-in user journey overview
 
+## Customer implementation (SSO-only sign-in) for TrustFrameworkExtensions_peter.xml
+
+This repo now includes a customer-specific policy variant in `TrustFrameworkExtensions_peter.xml` with the following behavior:
+
+- Sign-up is allowed using either:
+  - local account (`username/password`) via **Sign up now**
+  - SSO account via **Sign in with Microsoft**
+- Sign-in is allowed only via **SSO**
+- Local password sign-in is blocked with a user message
+- Password reset is blocked with a user message
+- Duplicate account prevention is enforced before social account creation
+
+### Core flow and logic
+
+1. **Step 1 (Combined page):** shows local sign-in form + Microsoft SSO button.
+  - Local sign-in submission is intentionally blocked and returns: `Sign-in with username/password is disabled. Please sign in with SSO.`
+  - `Forgot password` link is hidden.
+
+2. **Step 2:** executes either:
+  - `LocalAccountSignUpWithLogonEmail` (local sign-up), or
+  - `AADBSI-OpenIdConnect` (Microsoft SSO).
+
+3. **Step 3:** for SSO path, read user by `alternativeSecurityId` (existing linked SSO user).
+
+4. **Step 4 (duplicate prevention lookup):** if no `objectId` yet and `email` exists, lookup local account by email using `AAD-UserReadUsingEmailAddress-Takeover`.
+
+5. **Step 5 (link, not duplicate):** if matching local user is found, link SSO identity to the same directory object using `AAD-LinkSSOToExistingUser` and set `extension_ssoMigrated=true`.
+  - This prevents creation of a second account for the same person.
+
+6. **Step 6/8:** only when no account is found, continue first-time social profile collection and create a new social account.
+
+### Technical profiles used for the requirement
+
+- `SelfAsserted-LocalAccountSignin-Email`
+  - Blocks local password sign-in
+  - Hides forgot password link (`setting.forgotPasswordLinkLocation=None`)
+- `LocalAccountDiscoveryUsingEmailAddress`
+  - Blocks password reset attempts
+- `AAD-UserReadUsingEmailAddress-Takeover`
+  - Lookup by email before social account creation
+- `AAD-LinkSSOToExistingUser`
+  - Links social identity to existing local account and sets `extension_ssoMigrated`
+
+### Prerequisite configuration
+
+In `TrustFrameworkExtensions_peter.xml`, update the `AAD-Common` placeholders with your **b2c-extensions-app** values:
+
+- `INSERT_EXTENSIONS_APP_OBJECT_ID`
+- `INSERT_EXTENSIONS_APP_CLIENT_ID`
+
+Without these values, `extension_ssoMigrated` persistence will not work.
+
+### Working example test sequence
+
+1. Upload/update policies so this file is active as your extension policy.
+2. Run `B2C_1A_signup_signin`.
+3. Try local sign-in with email/password.
+  - Expected: blocked with SSO-only message.
+4. Click **Sign up now** and create a local account.
+  - Expected: local account creation succeeds.
+5. Sign out and sign in using Microsoft SSO with the same email.
+  - Expected: account is linked, no duplicate account created.
+6. Attempt password reset for that user.
+  - Expected: blocked with `Password reset is disabled. Please sign in with SSO.`
+
+This behavior gives you controlled migration to SSO while preventing duplicate user creation.
+
 This article gives an overview of the **local and social accounts sign-up or sign-in** user journey custom policies. We recommend you to read the [Azure AD B2C custom policy overview](https://docs.microsoft.com/azure/active-directory-b2c/custom-policy-overview) before reading this article.
 
 
