@@ -143,9 +143,11 @@
         </TechnicalProfile>
 
         <!-- When SSO creates a new user, also write email as signInNames.emailAddress.
-             This "claims" the email address so any subsequent local signup attempt
-             for the same email is blocked by RaiseErrorIfClaimsPrincipalAlreadyExists
-             in AAD-UserWriteUsingLogonEmail — preventing duplicate accounts. -->
+             This claims the email so any subsequent local signup with the same email
+             is blocked by RaiseErrorIfClaimsPrincipalAlreadyExists in
+             AAD-UserWriteUsingLogonEmail — preventing duplicate accounts.
+             The UserMessageIfClaimsPrincipalAlreadyExists on AAD-UserWriteUsingLogonEmail
+             override below surfaces the SSO-guidance message to the user. -->
         <TechnicalProfile Id="AAD-UserWriteUsingAlternativeSecurityId">
           <PersistedClaims>
             <PersistedClaim ClaimTypeReferenceId="alternativeSecurityId" />
@@ -157,6 +159,33 @@
             <PersistedClaim ClaimTypeReferenceId="surname" />
             <PersistedClaim ClaimTypeReferenceId="email" PartnerClaimType="signInNames.emailAddress" />
           </PersistedClaims>
+        </TechnicalProfile>
+
+        <!-- Override to surface a clear SSO-guidance message when local signup is blocked
+             because the email is already claimed by an SSO-first account.
+             UserMessageIfClaimsPrincipalAlreadyExists must be on the AAD write TP. -->
+        <TechnicalProfile Id="AAD-UserWriteUsingLogonEmail">
+          <Metadata>
+            <Item Key="UserMessageIfClaimsPrincipalAlreadyExists">An account already exists for this email via SSO. Please sign in using SSO instead of creating a local account.</Item>
+          </Metadata>
+        </TechnicalProfile>
+
+        <!-- Reads extension_ssoMigrated flag by objectId after password validation.
+             Only runs after login-NonInteractive has set objectId.
+             Used to conditionally block sign-in/reset for SSO-migrated users. -->
+        <TechnicalProfile Id="AAD-ReadSsoMigratedFlag">
+          <Metadata>
+            <Item Key="Operation">Read</Item>
+            <Item Key="RaiseErrorIfClaimsPrincipalDoesNotExist">true</Item>
+          </Metadata>
+          <IncludeInSso>false</IncludeInSso>
+          <InputClaims>
+            <InputClaim ClaimTypeReferenceId="objectId" Required="true" />
+          </InputClaims>
+          <OutputClaims>
+            <OutputClaim ClaimTypeReferenceId="extension_ssoMigrated" />
+          </OutputClaims>
+          <IncludeTechnicalProfile ReferenceId="AAD-Common" />
         </TechnicalProfile>
       </TechnicalProfiles>
     </ClaimsProvider>
@@ -185,56 +214,64 @@
       <TechnicalProfiles>
         <TechnicalProfile Id="SelfAsserted-LocalAccountSignin-Email">
           <Metadata>
-            <Item Key="setting.forgotPasswordLinkLocation">None</Item>
-            <Item Key="UserMessageIfClaimsTransformationBooleanValueIsNotEqual">Sign-in with username/password is disabled. Please sign in with SSO.</Item>
+            <Item Key="UserMessageIfClaimsTransformationBooleanValueIsNotEqual">This account has been migrated to SSO. Please sign in with SSO instead.</Item>
           </Metadata>
           <OutputClaims>
             <OutputClaim ClaimTypeReferenceId="signInName" Required="true" />
             <OutputClaim ClaimTypeReferenceId="password" Required="true" />
-            <OutputClaim ClaimTypeReferenceId="extension_ssoMigrated" DefaultValue="true" AlwaysUseDefaultValue="true" />
+            <OutputClaim ClaimTypeReferenceId="objectId" />
+            <OutputClaim ClaimTypeReferenceId="authenticationSource" />
+            <OutputClaim ClaimTypeReferenceId="extension_ssoMigrated" />
           </OutputClaims>
           <ValidationTechnicalProfiles>
-            <ValidationTechnicalProfile ReferenceId="ThrowSsoMigratedError" />
+            <!-- Step 1: validate credentials, sets objectId -->
+            <ValidationTechnicalProfile ReferenceId="login-NonInteractive" />
+            <!-- Step 2: read the real extension_ssoMigrated flag from the directory.
+                 ContinueOnError=true: if extension attributes are not yet configured or the
+                 attribute has no value for this user, skip gracefully so sign-in still works. -->
+            <ValidationTechnicalProfile ReferenceId="AAD-ReadSsoMigratedFlag" ContinueOnError="true" />
+            <!-- Step 3: block only users who have been migrated to SSO -->
+            <ValidationTechnicalProfile ReferenceId="ThrowSsoMigratedError">
+              <Preconditions>
+                <Precondition Type="ClaimEquals" ExecuteActionsIf="false">
+                  <Value>extension_ssoMigrated</Value>
+                  <Value>True</Value>
+                  <Action>SkipThisValidationTechnicalProfile</Action>
+                </Precondition>
+              </Preconditions>
+            </ValidationTechnicalProfile>
           </ValidationTechnicalProfiles>
         </TechnicalProfile>
 
         <TechnicalProfile Id="LocalAccountDiscoveryUsingEmailAddress">
           <Metadata>
-            <Item Key="UserMessageIfClaimsTransformationBooleanValueIsNotEqual">Password reset is disabled. Please sign in with SSO.</Item>
+            <Item Key="UserMessageIfClaimsTransformationBooleanValueIsNotEqual">This account has been migrated to SSO. Password reset is not available. Please sign in with SSO.</Item>
           </Metadata>
           <OutputClaims>
             <OutputClaim ClaimTypeReferenceId="email" PartnerClaimType="Verified.Email" Required="true" />
             <OutputClaim ClaimTypeReferenceId="objectId" />
-            <OutputClaim ClaimTypeReferenceId="extension_ssoMigrated" DefaultValue="true" AlwaysUseDefaultValue="true" />
-          </OutputClaims>
-          <ValidationTechnicalProfiles>
-            <ValidationTechnicalProfile ReferenceId="ThrowSsoMigratedError" />
-          </ValidationTechnicalProfiles>
-        </TechnicalProfile>
-
-        <TechnicalProfile Id="LocalAccountSignUpWithLogonEmail">
-          <Metadata>
-            <Item Key="IpAddressClaimReferenceId">IpAddress</Item>
-            <Item Key="ContentDefinitionReferenceId">api.localaccountsignup</Item>
-            <!-- Shown when email is already used by an SSO account or existing local account -->
-            <Item Key="UserMessageIfClaimsPrincipalAlreadyExists">An account with this email already exists. Please sign in using SSO instead.</Item>
-          </Metadata>
-          <OutputClaims>
-            <OutputClaim ClaimTypeReferenceId="objectId" />
-            <OutputClaim ClaimTypeReferenceId="email" PartnerClaimType="Verified.Email" Required="true" />
-            <OutputClaim ClaimTypeReferenceId="newPassword" Required="true" />
-            <OutputClaim ClaimTypeReferenceId="reenterPassword" Required="true" />
-            <OutputClaim ClaimTypeReferenceId="executed-SelfAsserted-Input" DefaultValue="true" />
+            <OutputClaim ClaimTypeReferenceId="userPrincipalName" />
             <OutputClaim ClaimTypeReferenceId="authenticationSource" />
-            <OutputClaim ClaimTypeReferenceId="newUser" />
-            <OutputClaim ClaimTypeReferenceId="displayName" />
-            <OutputClaim ClaimTypeReferenceId="givenName" />
-            <OutputClaim ClaimTypeReferenceId="surName" />
+            <OutputClaim ClaimTypeReferenceId="extension_ssoMigrated" />
           </OutputClaims>
           <ValidationTechnicalProfiles>
-            <ValidationTechnicalProfile ReferenceId="AAD-UserWriteUsingLogonEmail" />
+            <!-- Step 1: look up account by email, sets objectId -->
+            <ValidationTechnicalProfile ReferenceId="AAD-UserReadUsingEmailAddress" />
+              <!-- Step 2: read the real extension_ssoMigrated flag.
+                 ContinueOnError=true: same resilience as sign-in — don't fail password reset
+                 if extension attributes are not yet configured. -->
+            <ValidationTechnicalProfile ReferenceId="AAD-ReadSsoMigratedFlag" ContinueOnError="true" />
+            <!-- Step 3: block password reset only for SSO-migrated users -->
+            <ValidationTechnicalProfile ReferenceId="ThrowSsoMigratedError">
+              <Preconditions>
+                <Precondition Type="ClaimEquals" ExecuteActionsIf="false">
+                  <Value>extension_ssoMigrated</Value>
+                  <Value>True</Value>
+                  <Action>SkipThisValidationTechnicalProfile</Action>
+                </Precondition>
+              </Preconditions>
+            </ValidationTechnicalProfile>
           </ValidationTechnicalProfiles>
-          <UseTechnicalProfileForSessionManagement ReferenceId="SM-AAD" />
         </TechnicalProfile>
 
         <TechnicalProfile Id="LocalAccountWritePasswordUsingObjectId">
